@@ -1,0 +1,18 @@
+services:
+  house-portal:
+    image: ghcr.io/jayroo1976/house-portal:latest
+    # build: .          # uncomment to build locally instead
+    container_name: house-portal
+    restart: unless-stopped
+    ports:
+      - "3080:3000"
+    environment:
+      TZ: Asia/Dubai
+      APP_TITLE: "House Projects"
+      CURRENCY: AED
+      APP_USERS: "James:change-me-1,Wife:change-me-2"   # name:password, comma separated
+      BACKUP_CRON: "30 2 * * *"                         # nightly; "off" to disable
+      RCLONE_REMOTE: "onedrive:HouseProjects"           # remove if not using OneDrive yet
+    volumes:
+      - /mnt/user/appdata/house-portal/data:/data       # database + photos
+      - /mnt/user/appdata/house-portal/config:/config   # rclone.conf (OneDrive token)

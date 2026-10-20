@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>house-portal</Name>
+  <Repository>ghcr.io/jayroo1976/house-portal:latest</Repository>
+  <Registry>https://github.com/jayroo1976/house-portal/pkgs/container/house-portal</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/jayroo1976/house-portal</Support>
+  <Project>https://github.com/jayroo1976/house-portal</Project>
+  <Overview>Household project list with photos/ideas, quotes, budget and spend tracking, PDF export and OneDrive backup.</Overview>
+  <Category>Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:3000]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/jayroo1976/house-portal/main/public/icon.svg</Icon>
+  <Config Name="Web port" Target="3000" Default="3080" Mode="tcp" Description="Web UI" Type="Port" Display="always" Required="true">3080</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/house-portal/data" Mode="rw" Description="Database and uploaded photos" Type="Path" Display="always" Required="true">/mnt/user/appdata/house-portal/data</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/house-portal/config" Mode="rw" Description="Holds rclone.conf for OneDrive" Type="Path" Display="always" Required="true">/mnt/user/appdata/house-portal/config</Config>
+  <Config Name="Users" Target="APP_USERS" Default="James:change-me-1,Wife:change-me-2" Mode="" Description="name:password pairs, comma separated" Type="Variable" Display="always" Required="true">James:change-me-1,Wife:change-me-2</Config>
+  <Config Name="Currency" Target="CURRENCY" Default="AED" Mode="" Description="Currency label" Type="Variable" Display="always" Required="false">AED</Config>
+  <Config Name="OneDrive remote" Target="RCLONE_REMOTE" Default="onedrive:HouseProjects" Mode="" Description="rclone remote:path for backups (blank = local only)" Type="Variable" Display="always" Required="false">onedrive:HouseProjects</Config>
+  <Config Name="Backup schedule" Target="BACKUP_CRON" Default="30 2 * * *" Mode="" Description="Cron expression, or off" Type="Variable" Display="advanced" Required="false">30 2 * * *</Config>
+  <Config Name="Timezone" Target="TZ" Default="Asia/Dubai" Mode="" Description="" Type="Variable" Display="advanced" Required="false">Asia/Dubai</Config>
+</Container>
