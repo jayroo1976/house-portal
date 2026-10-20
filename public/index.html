@@ -116,7 +116,8 @@ function bindLogin() {
     try { const r = await api('/api/login', { json: { user: $('#u').value, password: $('#p').value } }); cfg.user = r.user; render(); }
     catch (e) { $('#e').textContent = e.message; }
   };
-  $('#go').onclick = go; $('#p').onkeydown = e => e.key === 'Enter' && go();
+  $('#go').onclick = go;
+  $('#p').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
 }
 
 async function menu() {
