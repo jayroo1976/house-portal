@@ -7,9 +7,12 @@ const multer = require('multer');
 const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { runBackup, status: backupStatus } = require('./backup');
+const importer = require('./importer');
 
 const DATA = process.env.DATA_DIR || '/data';
 const UPLOADS = path.join(DATA, 'uploads');
+const IMPORT_TMP = path.join(DATA, 'import-tmp');
+fs.mkdirSync(IMPORT_TMP, { recursive: true });
 const CURRENCY = process.env.CURRENCY || 'AED';
 const TITLE = process.env.APP_TITLE || 'House Projects';
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -184,10 +187,15 @@ app.put('/api/items/:id', (req, res) => {
       oneOf(b.priority, PRIORITIES, cur.priority), oneOf(b.status, STATUSES, cur.status), b.budget === undefined ? cur.budget : num(b.budget), b.notes ?? cur.notes, cur.id);
   res.json({ ok: true });
 });
+// A file can be shared by several items (e.g. one imported invoice), so only remove it from disk when nothing references it.
+function dropFilesIfUnused(names) {
+  const used = db.prepare('SELECT 1 FROM files WHERE filename=? LIMIT 1');
+  [...new Set(names)].forEach(n => { if (!used.get(n)) fs.rmSync(path.join(UPLOADS, n), { force: true }); });
+}
 app.delete('/api/items/:id', (req, res) => {
   const files = db.prepare('SELECT filename FROM files WHERE item_id=?').all(+req.params.id);
   db.prepare('DELETE FROM items WHERE id=?').run(+req.params.id);
-  files.forEach(f => fs.rmSync(path.join(UPLOADS, f.filename), { force: true }));
+  dropFilesIfUnused(files.map(f => f.filename));
   res.json({ ok: true });
 });
 
@@ -233,7 +241,7 @@ app.post('/api/items/:id/files', upload.array('files', 10), (req, res) => {
 app.put('/api/files/:id', (req, res) => { db.prepare('UPDATE files SET caption=? WHERE id=?').run(req.body.caption || '', +req.params.id); res.json({ ok: true }); });
 app.delete('/api/files/:id', (req, res) => {
   const f = db.prepare('SELECT filename FROM files WHERE id=?').get(+req.params.id);
-  if (f) { db.prepare('DELETE FROM files WHERE id=?').run(+req.params.id); fs.rmSync(path.join(UPLOADS, f.filename), { force: true }); }
+  if (f) { db.prepare('DELETE FROM files WHERE id=?').run(+req.params.id); dropFilesIfUnused([f.filename]); }
   res.json({ ok: true });
 });
 
@@ -244,6 +252,88 @@ app.post('/api/items/:id/comments', (req, res) => {
   res.json({ ok: true });
 });
 app.delete('/api/comments/:id', (req, res) => { db.prepare('DELETE FROM comments WHERE id=?').run(+req.params.id); res.json({ ok: true }); });
+
+// ---------- import (fuzzy; parse never writes, commit only writes what the user confirmed) ----------
+const memUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 1 } });
+const normKey = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+const TMP_NAME = /^[a-f0-9]{24}\.[a-z0-9]{1,8}$/;
+function sweepImportTmp() {
+  const cutoff = Date.now() - 3600e3;
+  try { fs.readdirSync(IMPORT_TMP).forEach(f => { const p = path.join(IMPORT_TMP, f); if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true }); }); } catch { }
+}
+
+app.post('/api/import/parse', memUpload.single('file'), async (req, res) => {
+  try {
+    sweepImportTmp();
+    const rooms = db.prepare("SELECT DISTINCT room FROM items WHERE room<>''").all().map(r => r.room);
+    let parsed, file = null, fileName = '';
+    if (req.file) {
+      fileName = req.file.originalname;
+      parsed = await importer.parseFile(req.file.buffer, fileName, { rooms });
+      const ext = path.extname(fileName).toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 8) || '.bin';
+      file = crypto.randomBytes(12).toString('hex') + ext;
+      fs.writeFileSync(path.join(IMPORT_TMP, file), req.file.buffer);
+    } else if (typeof (req.body || {}).text === 'string' && req.body.text.trim()) {
+      parsed = importer.parseText(req.body.text.slice(0, 200000), { rooms });
+    } else {
+      return res.status(400).json({ error: 'Choose a file or paste some text first' });
+    }
+    const titles = new Set(db.prepare('SELECT title FROM items').all().map(i => normKey(i.title)));
+    parsed.rows.forEach(r => { r.dup = titles.has(normKey(r.title)); });
+    parsed.refExists = !!(parsed.ref && db.prepare("SELECT 1 FROM items WHERE notes LIKE ? UNION SELECT 1 FROM quotes WHERE notes LIKE ? LIMIT 1").get(`%${parsed.ref}%`, `%${parsed.ref}%`));
+    res.json({ ...parsed, file, fileName, existingRooms: rooms.sort() });
+  } catch (e) {
+    console.error('import parse failed:', e.message);
+    res.status(422).json({ error: e.message || 'Could not read that file' });
+  }
+});
+
+app.post('/api/import/commit', (req, res) => {
+  const { meta = {}, rows } = req.body || {};
+  if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'Nothing to import' });
+  if (rows.length > 500) return res.status(400).json({ error: 'Too many rows (max 500 at a time)' });
+  const today = new Date().toISOString().slice(0, 10);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(meta.date || '') ? meta.date : today;
+  const qStatus = meta.quoteStatus === 'Accepted' ? 'Accepted' : 'Received';
+  const defVendor = String(meta.vendor || '').trim().slice(0, 120);
+  const ref = String(meta.ref || '').trim().slice(0, 60);
+  const label = ref || String(meta.fileName || '').slice(0, 80) || 'import';
+
+  let stored = null;
+  if (TMP_NAME.test(meta.file || '') && fs.existsSync(path.join(IMPORT_TMP, meta.file))) {
+    fs.copyFileSync(path.join(IMPORT_TMP, meta.file), path.join(UPLOADS, meta.file));
+    stored = meta.file;
+  }
+  const kind = meta.fileKind === 'receipt' ? 'receipt' : 'quote';
+  const insItem = db.prepare('INSERT INTO items(title,room,category,priority,status,budget,notes,created_by) VALUES(?,?,?,?,?,?,?,?)');
+  const insQuote = db.prepare('INSERT INTO quotes(item_id,vendor,amount,quote_date,status,notes,created_by) VALUES(?,?,?,?,?,?,?)');
+  const insSpend = db.prepare('INSERT INTO spend(item_id,vendor,amount,spend_date,notes,created_by) VALUES(?,?,?,?,?,?)');
+  const insFile = db.prepare('INSERT INTO files(item_id,kind,filename,original,caption,created_by) VALUES(?,?,?,?,?,?)');
+  const ids = [];
+  try {
+    db.transaction(() => {
+      for (const r of rows) {
+        const title = String(r.title || '').trim().slice(0, 200);
+        if (!title) continue;
+        const budget = num(r.budget), quote = num(r.quote), spent = num(r.spent);
+        const derived = quote > 0 && qStatus === 'Accepted' ? 'Approved' : spent > 0 ? 'In progress' : quote > 0 ? 'Getting quotes' : 'Idea';
+        const notes = [String(r.notes || '').trim().slice(0, 2000), `Source: ${label}`].filter(Boolean).join('\n');
+        const id = insItem.run(title, String(r.room || '').trim().slice(0, 80), String(r.category || '').trim().slice(0, 80),
+          oneOf(r.priority, PRIORITIES, 'Nice to have'), oneOf(r.status, STATUSES, derived), budget, notes, req.user).lastInsertRowid;
+        const vendor = String(r.vendor || '').trim().slice(0, 120) || defVendor || 'Unknown vendor';
+        if (quote > 0) insQuote.run(id, vendor, quote, date, qStatus, ref, req.user);
+        if (spent > 0) insSpend.run(id, vendor, spent, date, `Imported: ${label}`, req.user);
+        if (stored) insFile.run(id, kind, stored, String(meta.fileName || stored).slice(0, 120), '', req.user);
+        ids.push(id);
+      }
+    })();
+  } catch (e) {
+    if (stored) fs.rmSync(path.join(UPLOADS, stored), { force: true });
+    throw e;
+  }
+  if (stored) { if (!ids.length) fs.rmSync(path.join(UPLOADS, stored), { force: true }); fs.rmSync(path.join(IMPORT_TMP, meta.file), { force: true }); }
+  res.json({ created: ids.length, ids });
+});
 
 // ---------- exports ----------
 const money = n => `${CURRENCY} ${Math.round(n || 0).toLocaleString('en-US')}`;
@@ -351,5 +441,10 @@ app.post('/api/backup', async (req, res) => {
 });
 const sched = process.env.BACKUP_CRON || '30 2 * * *'; // nightly 02:30
 if (sched !== 'off') cron.schedule(sched, () => runBackup(db).catch(e => console.error('backup failed:', e.message)), { timezone: process.env.TZ || 'UTC' });
+
+app.use((err, req, res, next) => { // JSON errors (e.g. upload too large) instead of HTML
+  if (res.headersSent) return next(err);
+  res.status(err.status || (err.code === 'LIMIT_FILE_SIZE' ? 413 : 500)).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'File too large (max 25 MB)' : (err.message || 'Server error') });
+});
 
 app.listen(PORT, () => console.log(`${TITLE} listening on :${PORT}, data in ${DATA}, users: ${Object.keys(USERS).join(', ')}`));

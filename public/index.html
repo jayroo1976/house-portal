@@ -58,6 +58,16 @@ td.r{text-align:right;white-space:nowrap}
 .back{background:none;border:0;color:var(--acc);font-weight:600;padding:6px 0}
 .comment{border-left:3px solid var(--acc2);padding:2px 8px;margin:8px 0}
 .comment small{color:var(--muted)}
+header .hbtn{margin-left:auto}
+.cols3{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:6px}
+.cols3 label{margin:0 0 2px}
+.irow.off{opacity:.5}
+.irow.dup{border-color:var(--amber)}
+.ok{color:var(--acc);font-size:13px;margin:6px 0}
+.warn{color:var(--amber);font-size:13px;margin:6px 0}
+.sumbar{position:sticky;bottom:0;background:var(--bg);padding:8px 0 calc(8px + env(safe-area-inset-bottom));border-top:1px solid var(--line)}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(24px + env(safe-area-inset-bottom));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:99px;font-size:14px;z-index:20}
+input[type=checkbox]{width:20px;height:20px;padding:0;flex:none}
 </style>
 </head>
 <body>
@@ -100,9 +110,15 @@ async function boot() {
 function render() {
   const app = $('#app');
   if (!cfg.user) return app.innerHTML = loginHtml(), bindLogin();
-  app.innerHTML = `<header>${state.view !== 'list' ? '' : ''}<h1>${esc(cfg.title)}</h1><button id="menu">${esc(cfg.user)}</button></header><main id="main"></main>`;
+  app.innerHTML = `<header><h1>${esc(cfg.title)}</h1><button id="imp" class="hbtn">Import</button><button id="menu">${esc(cfg.user)}</button></header><main id="main"></main>`;
   $('#menu').onclick = menu;
-  state.view === 'list' ? renderList() : renderItem();
+  $('#imp').onclick = () => { imp = null; state.view = 'import'; render(); };
+  state.view === 'list' ? renderList() : state.view === 'import' ? renderImport() : renderItem();
+}
+
+function toast(msg) {
+  const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
 }
 
 function loginHtml() {
@@ -251,6 +267,138 @@ async function renderItem() {
   del('data-del-file', '/api/files'); del('data-del-comment', '/api/comments'); del('data-del-quote', '/api/quotes'); del('data-del-spend', '/api/spend');
   document.querySelectorAll('[data-qstatus]').forEach(el => el.onchange = async () => { await api('/api/quotes/' + el.dataset.qstatus, { method: 'PUT', json: { status: el.value } }); done(); });
 }
+// ---------------- import ----------------
+let imp = null;
+const MODE_LABEL = { budget: 'Budget only', quote: 'Quote received', accepted: 'Accepted quote', paid: 'Already paid' };
+const COL_LABEL = ['Last number', '2nd from last', '3rd from last', '4th from last'];
+const numOrNull = v => { const s = String(v).trim(); if (s === '') return null; const n = parseFloat(s.replace(/,/g, '')); return Number.isFinite(n) ? n : null; };
+
+function applyMode(r) {
+  if (r.explicit) return;
+  const a = r.amount == null ? null : r.amount;
+  r.budget = a;
+  r.quote = (imp.mode === 'quote' || imp.mode === 'accepted') ? a : null;
+  r.spent = imp.mode === 'paid' ? a : null;
+}
+function prepRow(r) {
+  if (r.pAuto) r.priority = (imp.mode === 'accepted' || imp.mode === 'paid') ? 'Important' : 'Nice to have';
+  applyMode(r);
+}
+
+function renderImport() {
+  if (imp && imp.stage === 'review') return renderImportReview();
+  renderImportPick();
+}
+
+function renderImportPick(err) {
+  $('#main').innerHTML = `
+  <button class="back" id="back">&larr; All items</button>
+  <div class="card"><h2>Import items</h2>
+    <div class="meta">Drop in an invoice, quote or list (PDF, Excel, CSV or text), or paste text below. The app works out the line items, vendor, amounts and rooms. You check and edit everything before anything is added.</div>
+    <label>File</label><input type="file" id="ifile" accept=".pdf,.xlsx,.csv,.tsv,.txt,.md,application/pdf,text/*">
+    <label>...or paste text</label><textarea id="itext" rows="6" placeholder="Kitchen:&#10;- New tap 450&#10;- Re-grout counter 300&#10;Garden:&#10;- Pergola 12,000"></textarea>
+    <div class="sp"></div><button class="btn" id="iparse">Read it</button>
+    <div class="err" id="ierr">${esc(err || '')}</div></div>`;
+  $('#back').onclick = () => { imp = null; state.view = 'list'; render(); };
+  $('#iparse').onclick = async () => {
+    const f = $('#ifile').files[0], text = $('#itext').value;
+    const btn = $('#iparse'); btn.disabled = true; btn.textContent = 'Reading...'; $('#ierr').textContent = '';
+    try {
+      let r;
+      if (f) { const fd = new FormData(); fd.append('file', f); r = await api('/api/import/parse', { method: 'POST', body: fd }); }
+      else r = await api('/api/import/parse', { json: { text } });
+      startReview(r);
+    } catch (e) { btn.disabled = false; btn.textContent = 'Read it'; $('#ierr').textContent = e.message === 'auth' ? '' : e.message; }
+  };
+}
+
+function startReview(r) {
+  imp = {
+    stage: 'review', src: r, k: r.k || 1,
+    mode: r.docType === 'invoice' ? 'accepted' : r.docType === 'quote' ? 'quote' : r.docType === 'receipt' ? 'paid' : 'budget',
+    vendor: r.vendor || '', ref: r.ref || '', date: r.date || new Date().toISOString().slice(0, 10),
+    file: r.file, fileName: r.fileName, rooms: r.existingRooms || [],
+    rows: r.rows.map(x => ({ ...x, include: !x.dup, pAuto: !x.priority }))
+  };
+  imp.rows.forEach(prepRow);
+  renderImportReview();
+}
+
+function renderImportReview() {
+  const s = imp, r = s.src;
+  const colSum = k => s.rows.reduce((t, x) => t + (x.nums && x.nums.length ? (x.nums[Math.max(0, x.nums.length - k)] || 0) : 0), 0);
+  const prio = cfg.priorities;
+  let h = `<button class="back" id="back">&larr; Start over</button>
+  <div class="card"><h2>Check before importing</h2>
+    <div class="meta">${esc(s.fileName || 'Pasted text')} - found ${s.rows.length} line${s.rows.length === 1 ? '' : 's'}${r.docType ? ' (' + esc(r.docType) + ')' : ''}. Untick anything you don't want; edit anything that's off.</div>
+    ${(r.warnings || []).map(w => `<div class="warn">${esc(w)}</div>`).join('')}
+    ${r.refExists ? `<div class="warn">${esc(r.ref)} looks like it was already imported. Matching lines are unticked.</div>` : ''}
+    <div class="row"><div><label>Vendor</label><input id="iv" value="${esc(s.vendor)}" placeholder="Who is it from?"></div>
+    <div><label>Reference</label><input id="ir" value="${esc(s.ref)}"></div></div>
+    <div class="row"><div><label>Date</label><input id="id" type="date" value="${esc(s.date)}"></div>
+    <div><label>Treat the amounts as</label><select id="im">${Object.entries(MODE_LABEL).map(([k, v]) => `<option value="${k}" ${k === s.mode ? 'selected' : ''}>${v}</option>`).join('')}</select></div></div>
+    ${r.maxK > 1 ? `<label>Which number is the amount?</label><select id="ik">${Array.from({ length: r.maxK }, (_, i) => i + 1).map(k => `<option value="${k}" ${k === s.k ? 'selected' : ''}>${COL_LABEL[k - 1]} = ${money(colSum(k))}</option>`).join('')}</select>` : ''}
+    <datalist id="rooms">${s.rooms.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
+  </div>`;
+  h += s.rows.map((x, i) => `<div class="card irow ${x.include ? '' : 'off'} ${x.dup ? 'dup' : ''}" data-i="${i}">
+    <div class="row"><input type="checkbox" class="auto" data-f="include" ${x.include ? 'checked' : ''}><input data-f="title" value="${esc(x.title)}"></div>
+    ${x.dup ? '<div class="meta">Looks like an item you already have.</div>' : ''}
+    <div class="row" style="margin-top:6px"><input data-f="room" list="rooms" placeholder="Room" value="${esc(x.room)}"><input data-f="category" placeholder="Category" value="${esc(x.category)}"><select data-f="priority">${prio.map(p => `<option ${p === x.priority ? 'selected' : ''}>${esc(p)}</option>`).join('')}</select></div>
+    <div class="cols3"><div><label>Budget</label><input data-f="budget" type="number" step="any" inputmode="decimal" value="${x.budget ?? ''}"></div>
+    <div><label>Quote</label><input data-f="quote" type="number" step="any" inputmode="decimal" value="${x.quote ?? ''}"></div>
+    <div><label>Paid</label><input data-f="spent" type="number" step="any" inputmode="decimal" value="${x.spent ?? ''}"></div></div></div>`).join('');
+  if (!s.rows.length) h += `<div class="card meta">Nothing recognisable found. Go back and try another file, or paste the text.</div>`;
+  h += `<div class="sumbar" id="isum"></div><div style="height:10px"></div>`;
+  $('#main').innerHTML = h;
+  updateImportSummary();
+
+  const main = $('#main');
+  $('#back').onclick = () => { imp = null; renderImport(); };
+  main.oninput = main.onchange = ev => {
+    const t = ev.target, card = t.closest('.irow');
+    if (card) {
+      const row = s.rows[+card.dataset.i], f = t.dataset.f;
+      if (f === 'include') { row.include = t.checked; card.classList.toggle('off', !t.checked); }
+      else if (['budget', 'quote', 'spent'].includes(f)) { row[f] = numOrNull(t.value); row.explicit = true; }
+      else if (f) { row[f] = t.value; if (f === 'priority') row.pAuto = false; }
+      updateImportSummary(); return;
+    }
+    if (t.id === 'iv') s.vendor = t.value;
+    else if (t.id === 'ir') s.ref = t.value;
+    else if (t.id === 'id') s.date = t.value;
+    else if (t.id === 'im' && ev.type === 'change') { s.mode = t.value; s.rows.forEach(prepRow); renderImportReview(); }
+    else if (t.id === 'ik' && ev.type === 'change') {
+      s.k = +t.value;
+      s.rows.forEach(x => { if (x.nums && x.nums.length) { x.amount = x.nums[Math.max(0, x.nums.length - s.k)]; x.explicit = false; } prepRow(x); });
+      renderImportReview();
+    }
+  };
+  main.onclick = async ev => {
+    if (!ev.target.closest('#icommit')) return;
+    const btn = ev.target.closest('#icommit'); btn.disabled = true; btn.textContent = 'Importing...';
+    const rows = s.rows.filter(x => x.include).map(x => ({ title: x.title, room: x.room, category: x.category, priority: x.priority, status: x.status, notes: x.notes, vendor: x.vendor, budget: x.budget, quote: x.quote, spent: x.spent }));
+    try {
+      const res = await api('/api/import/commit', { json: { meta: { vendor: s.vendor, ref: s.ref, date: s.date, quoteStatus: s.mode === 'accepted' ? 'Accepted' : 'Received', file: s.file, fileName: s.fileName, fileKind: s.mode === 'paid' ? 'receipt' : 'quote' }, rows } });
+      imp = null; state.view = 'list'; render(); toast(`Imported ${res.created} item${res.created === 1 ? '' : 's'}`);
+    } catch (e) { btn.disabled = false; alert('Import failed: ' + e.message); updateImportSummary(); }
+  };
+}
+
+function updateImportSummary() {
+  const s = imp, inc = s.rows.filter(x => x.include);
+  const tot = k => inc.reduce((t, x) => t + (+x[k] || 0), 0);
+  const sumAmt = inc.reduce((t, x) => t + (+x.amount || 0), 0);
+  const docTotals = (s.src.totals || []);
+  let check = '';
+  if (docTotals.length && inc.some(x => x.amount != null)) {
+    const hit = docTotals.find(t => Math.abs(t - sumAmt) < 0.01);
+    check = hit != null ? `<div class="ok">&#10003; Selected lines add up to the document total (${money(hit)}).</div>`
+      : `<div class="warn">Selected lines add up to ${money(sumAmt)}; the document shows ${docTotals.slice().sort((a, b) => b - a).slice(0, 3).map(money).join(' / ')}.</div>`;
+  }
+  $('#isum').innerHTML = `${check}<div class="meta">${inc.length} of ${s.rows.length} selected | budget ${money(tot('budget'))} | quoted ${money(tot('quote'))} | paid ${money(tot('spent'))}</div>
+    <button class="btn" id="icommit" style="width:100%;margin-top:6px" ${inc.length ? '' : 'disabled'}>Import ${inc.length} item${inc.length === 1 ? '' : 's'}</button>`;
+}
+
 boot();
 </script>
 </body>

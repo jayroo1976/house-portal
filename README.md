@@ -8,9 +8,22 @@ A small self-hosted app for tracking everything the house needs, from essential 
 - **Budget vs committed vs spent** overall and per priority; payments and receipts per item
 - **PDF export** (with or without photos) and CSV, honouring the active filters
 - **OneDrive backup** nightly (rclone) with automatic restore on an empty `/data`
+- **Fuzzy import** (Import button, top right): drop in an invoice/quote PDF, Excel, CSV or text, or paste a list. It works out the lines, vendor, reference, date, amounts, rooms and categories; you tick/edit everything before it's added. See below.
 - Two or more named logins, mobile-first UI, installable to a phone home screen
 
-Stack: Node 20, Express, SQLite (better-sqlite3), PDFKit. One container, two volumes.
+Stack: Node 20, Express, SQLite (better-sqlite3), PDFKit, pdf.js (PDF reading). One container, two volumes.
+
+## Import
+
+No fixed template. It understands:
+
+- **PDF invoices / quotations** (text-based): finds the line-item table, glues wrapped descriptions back together, picks out vendor, invoice/quote number and date, and checks the lines against the document total (a green tick means they add up). If a line has several numbers (qty, rate, VAT, amount) pick which one is the amount; the default is the one that reconciles with the total.
+- **Excel (.xlsx) and CSV**: headers are matched loosely (Item/Task/Name, Room/Area, Priority/Importance, Budget/Estimate, Quote, Paid/Spent, Notes...); with no header, the first text column is the item and the last number is the amount.
+- **Pasted or .txt lists**: one item per line with the amount at the end (`Pergola 12,000`, `Sofa - AED 4,500`, `Curtains 2.5k`); a heading like `Kitchen:` sets the room for the lines under it.
+
+Choose how amounts are treated: budget only, quote received, accepted quote (committed), or already paid. The original file is attached to every item it creates. Lines that look like existing items are unticked, and a document reference that's already been imported is flagged.
+
+Limits: scanned PDFs and photos can't be read (no OCR); old `.xls` and Word files aren't supported. Room, category and priority are guesses - check them on the review screen.
 
 ## Deploy on Unraid
 
